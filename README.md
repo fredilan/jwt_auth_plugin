@@ -25,7 +25,15 @@ git clone https://github.com/Thalhammer/jwt-cpp.git
 sudo cp -r jwt-cpp/include/jwt-cpp /usr/local/include/
 ```
 
-Note: Ensure `flashmq_plugin.h` from your FlashMQ installation is present in your build folder or available in standard system include paths (`/usr/include` or `/usr/local/include`).
+Note: Ensure `flashmq_plugin.h` and `flashmq_public.h` from your FlashMQ installation is present in your build folder or available in standard system include paths (`/usr/include` or `/usr/local/include`).
+
+### Copy Header files from FlashMQ repo
+
+``` bash
+wget https://raw.githubusercontent.com/halfgaar/FlashMQ/master/flashmq_plugin.h
+wget https://raw.githubusercontent.com/halfgaar/FlashMQ/master/flashmq_public.h
+```
+
 
 ### 2. Directory Structure
 Organize your project repository as follows:
@@ -80,10 +88,10 @@ sudo chown flashmq:flashmq /etc/flashmq/jwt_secret.key
 Configure `/etc/flashmq/flashmq.conf`. Ensure `allow_anonymous false` is defined at the top of the file before any `listen` blocks to prevent unauthenticated bypasses.
 
 ``` plaintext
-Global Auth Rules (MUST BE PLACED BEFORE LISTENERS)
+# Global Auth Rules (MUST BE PLACED BEFORE LISTENERS)
 allow_anonymous false
 
-Listeners
+# Listeners
 listen {
 protocol mqtt
 port     1883
@@ -106,15 +114,15 @@ client_verification_still_do_authn true
 allow_anonymous false
 }
 
-Authentication Plugin
+# Authentication Plugin
 plugin /etc/flashmq/jwt_auth_plugin.so
 
-Storage & System Options
+# Storage & System Options
 storage_dir /var/lib/flashmq
 max_qos_msg_pending_per_client 1000
 log_level debug
 ```
-Restart FlashMQ to apply changes:
+### Restart FlashMQ to apply changes:
 
 ``` bash
 sudo systemctl restart flashmq
