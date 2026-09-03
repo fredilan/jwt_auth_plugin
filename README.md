@@ -93,25 +93,25 @@ allow_anonymous false
 
 # Listeners
 listen {
-protocol mqtt
-port     1883
-allow_anonymous false
+    protocol mqtt
+    port     1883
+    allow_anonymous false
 }
 
 listen {
-protocol  mqtt
-port      8883
+    protocol  mqtt
+    port      8883
 
-# Server Certificate and Private Key
-fullchain /etc/flashmq/certs/server.crt
-privkey   /etc/flashmq/certs/server.key
+    # Server Certificate and Private Key
+    fullchain /etc/flashmq/certs/server.crt
+    privkey   /etc/flashmq/certs/server.key
 
-# Client CA for mTLS
-client_verification_ca_file /etc/flashmq/certs/ca.crt
+    # Client CA for mTLS
+    client_verification_ca_file /etc/flashmq/certs/ca.crt
 
-# Force dual authentication (mTLS + JWT Password Check)
-client_verification_still_do_authn true
-allow_anonymous false
+    # Force dual authentication (mTLS + JWT Password Check)
+    client_verification_still_do_authn true
+    allow_anonymous false
 }
 
 # Authentication Plugin
