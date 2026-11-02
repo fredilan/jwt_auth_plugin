@@ -1,0 +1,8 @@
+[Unit]
+Description=Fetch the MQTT JWT revocation list for the FlashMQ jwt_auth_plugin
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/flashmq-fetch-revocations
