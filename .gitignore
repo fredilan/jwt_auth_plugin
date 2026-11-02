@@ -1,0 +1,4 @@
+jwt_auth_plugin.so
+tests/test_jwt_auth
+flashmq_plugin.h
+flashmq_public.h
