@@ -5,6 +5,7 @@ An enterprise-grade C++ authentication plugin for [FlashMQ](https://www.flashmq.
 - **HS256 JWT Verification:** Validates token signatures and structure using `jwt-cpp` and OpenSSL. `exp` is **required** and enforced.
 - **Username / Subject Matching (fail closed):** The MQTT username must be non-empty and equal the JWT's `sub` claim; a token without `sub` is refused. On a listener with `client_verification_ca_file`, FlashMQ replaces the username with the client certificate's CN, so this check **binds the JWT to the client certificate**.
 - **Token Revocation:** Optional revocation list from the API (`plugin_opt_revocation_file`). JWTs for a username issued before its revocation time are refused, and connected clients holding one are disconnected (FlashMQ has no CRL support).
+- **Topic ACL:** Optional per-client publish/subscribe ACL from the JWT `acl` claim set by the API (`plugin_opt_acl_mode off|log|enforce`, §8). A device may only use its own topics.
 - **Externalized Secret Key:** Loads the HMAC key from a separate secured file (`plugin_opt_jwt_secret_file`) instead of hardcoding credentials. Re-read on reload (SIGHUP).
 - **Strict Network Security:** Compatible with dual-layer authentication (mTLS + Application-level JWT) and strict non-anonymous connection configurations.
 
@@ -118,6 +119,8 @@ plugin /etc/flashmq/jwt_auth_plugin.so
 plugin_opt_jwt_secret_file /etc/flashmq/jwt_secret.key
 # Optional: token revocation (§7). Re-read every plugin_timer_period seconds when it changes.
 plugin_opt_revocation_file /etc/flashmq/revocations.txt
+# Optional: topic ACL from the JWT acl claim (§8): off | log | enforce
+plugin_opt_acl_mode log
 plugin_timer_period 30
 
 # Storage & System Options
@@ -130,6 +133,7 @@ log_level info
 |---|---|---|
 | `plugin_opt_jwt_secret_file` | `/etc/flashmq/jwt_secret.key` | HS256 key file |
 | `plugin_opt_revocation_file` | empty (revocation off) | `<username> <unix-time>` per line; `#` comments |
+| `plugin_opt_acl_mode` | `off` | `off` = no ACL; `log` = allow all, log `acl denied (would deny)`; `enforce` = deny. Unknown value = `enforce` |
 ### Restart FlashMQ to apply changes:
 
 ``` bash
@@ -189,3 +193,27 @@ The API publishes `GET /api/v2/broker/revocations` (text/plain, `<serial> <unix-
 
 **Effect:** when a device is re-provisioned or deprovisioned, its old JWTs stop working within about `60 s + plugin_timer_period`, and connected sessions using them are dropped. The device has to call `/login_check` again for a new token.
 
+## 8. Topic ACL (`plugin_opt_acl_mode`)
+The SousChef API adds an `acl` claim to every MQTT JWT (`MqttTopicAclBuilder`):
+
+```json
+{"v": 1, "pub": ["/duke/iot/SN1/status", "/duke/iot/SN1/events", "/duke/iot/SN1/response/+"],
+         "sub": ["/duke/iot/SN1/request/+", "/duke/iot/SN1/command", "/duke/iot/SN1/firmware"]}
+```
+SCC gateways also get `/duke/iot/gateways/<serial>/provision|discovery|status` (pub) and `.../provision/response` (sub). The API's service account gets `{"v": 1, "super": true}`.
+
+| Access | Checked against |
+|---|---|
+| Publish, will | `pub` |
+| Subscribe | `sub`: every topic the filter can match must be covered (a device can't subscribe to `#` or `+/request/+`) |
+| Delivery | `sub` (the receiving client's) |
+
+- `enforce`: a token without a valid `acl` claim (absent, wrong `v`, malformed) is refused at login. `log`: it is allowed and logged once at login.
+- The legacy `subs` / `publ` claims are ignored.
+- ACLs are kept per client id and replaced on each login; entries of disconnected clients are dropped in the periodic event (`plugin_timer_period`).
+
+Rollout:
+1. Deploy the API version that issues `acl` claims.
+2. `plugin_opt_acl_mode log`, restart; watch `acl denied (would deny)` and `has no valid acl claim` for ≥ 2 weeks.
+3. Wait until old device tokens (no `acl`, ~30 days) have expired, or revoke them (§7).
+4. `plugin_opt_acl_mode enforce`, restart.
