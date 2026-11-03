@@ -67,6 +67,25 @@ static std::string write_file(const std::string &path, const std::string &conten
     return path;
 }
 
+static std::string acl_token(const std::string &sub, const std::string &acl_json) {
+    picojson::value acl;
+    std::string err = picojson::parse(acl, acl_json);
+    if (!err.empty()) {
+        std::cerr << "bad test acl json: " << err << std::endl;
+    }
+    return jwt::create().set_type("JWT").set_subject(sub)
+        .set_issued_at(std::chrono::system_clock::now())
+        .set_expires_at(std::chrono::system_clock::now() + std::chrono::hours(1))
+        .set_payload_claim("acl", jwt::claim(acl))
+        .sign(jwt::algorithm::hs256{SECRET});
+}
+
+static AuthResult acl(const std::string &clientid, const std::string &username, AclAccess access, const std::string &topic) {
+    std::vector<std::string> subtopics;
+    return flashmq_plugin_acl_check(nullptr, access, clientid, username, topic, subtopics, "", std::string_view(),
+        0, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, nullptr);
+}
+
 int main() {
     char dir_template[] = "/tmp/jwt_auth_test.XXXXXX";
     std::string dir = mkdtemp(dir_template);
@@ -130,6 +149,80 @@ int main() {
     std::unordered_map<std::string, std::string> opts_off{{"jwt_secret_file", secret_file}};
     flashmq_plugin_main_init(opts_off);
     CHECK("no revocation_file: old SN-A token allowed", login("y1", "SN-A", token("SN-A", true, now - 30)) == AuthResult::success);
+
+
+    // --- topic ACL (acl_mode) ---
+    const std::string DEVICE_ACL = R"({"v":1,"pub":["/duke/iot/SN1/status","/duke/iot/SN1/response/+"],"sub":["/duke/iot/SN1/request/+","/duke/iot/SN1/command"]})";
+    const std::string GATEWAY_ACL = R"({"v":1,"pub":["/duke/iot/GW1/status","/duke/iot/gateways/GW1/provision"],"sub":["/duke/iot/gateways/GW1/provision/response"]})";
+    const AuthResult OK = AuthResult::success;
+    const AuthResult NO = AuthResult::acl_denied;
+
+    std::unordered_map<std::string, std::string> opts_enforce{{"jwt_secret_file", secret_file}, {"acl_mode", "enforce"}};
+    flashmq_plugin_main_init(opts_enforce);
+
+    CHECK("acl: device login", login("a1", "SN1", acl_token("SN1", DEVICE_ACL)) == OK);
+    CHECK("acl: publish own status", acl("a1", "SN1", AclAccess::write, "/duke/iot/SN1/status") == OK);
+    CHECK("acl: publish own response/<id>", acl("a1", "SN1", AclAccess::write, "/duke/iot/SN1/response/abc") == OK);
+    CHECK("acl: publish response/<id>/<extra> denied", acl("a1", "SN1", AclAccess::write, "/duke/iot/SN1/response/a/b") == NO);
+    CHECK("acl: publish other device denied", acl("a1", "SN1", AclAccess::write, "/duke/iot/SN2/status") == NO);
+    CHECK("acl: publish on own sub-only topic denied", acl("a1", "SN1", AclAccess::write, "/duke/iot/SN1/command") == NO);
+    CHECK("acl: deliver own request", acl("a1", "SN1", AclAccess::read, "/duke/iot/SN1/request/x") == OK);
+    CHECK("acl: deliver other device denied", acl("a1", "SN1", AclAccess::read, "/duke/iot/SN2/request/x") == NO);
+    CHECK("acl: subscribe own request/+", acl("a1", "SN1", AclAccess::subscribe, "/duke/iot/SN1/request/+") == OK);
+    CHECK("acl: subscribe own request/<id>", acl("a1", "SN1", AclAccess::subscribe, "/duke/iot/SN1/request/abc") == OK);
+    CHECK("acl: subscribe # denied", acl("a1", "SN1", AclAccess::subscribe, "#") == NO);
+    CHECK("acl: subscribe /duke/iot/# denied", acl("a1", "SN1", AclAccess::subscribe, "/duke/iot/#") == NO);
+    CHECK("acl: subscribe own /# denied", acl("a1", "SN1", AclAccess::subscribe, "/duke/iot/SN1/#") == NO);
+    CHECK("acl: subscribe +/request/+ denied", acl("a1", "SN1", AclAccess::subscribe, "/duke/iot/+/request/+") == NO);
+    CHECK("acl: will on own status", acl("a1", "SN1", AclAccess::register_will, "/duke/iot/SN1/status") == OK);
+    CHECK("acl: will on other topic denied", acl("a1", "SN1", AclAccess::register_will, "/duke/iot/SN2/status") == NO);
+    CHECK("acl: device can't act as gateway", acl("a1", "SN1", AclAccess::write, "/duke/iot/gateways/SN1/provision") == NO);
+    CHECK("acl: device can't read gateway responses", acl("a1", "SN1", AclAccess::subscribe, "/duke/iot/gateways/GW1/provision/response") == NO);
+
+    CHECK("acl: gateway login", login("g1", "GW1", acl_token("GW1", GATEWAY_ACL)) == OK);
+    CHECK("acl: gateway publishes own provision", acl("g1", "GW1", AclAccess::write, "/duke/iot/gateways/GW1/provision") == OK);
+    CHECK("acl: gateway publishes other gateway denied", acl("g1", "GW1", AclAccess::write, "/duke/iot/gateways/GW2/provision") == NO);
+    CHECK("acl: gateway reads own provision response", acl("g1", "GW1", AclAccess::read, "/duke/iot/gateways/GW1/provision/response") == OK);
+
+    CHECK("acl: service login", login("svc", "api", acl_token("api", R"({"v":1,"super":true})")) == OK);
+    CHECK("acl: super subscribes /duke/iot/#", acl("svc", "api", AclAccess::subscribe, "/duke/iot/#") == OK);
+    CHECK("acl: super receives any delivery", acl("svc", "api", AclAccess::read, "/duke/iot/SN1/status") == OK);
+    CHECK("acl: super publishes requests", acl("svc", "api", AclAccess::write, "/duke/iot/SN1/request/1") == OK);
+
+    CHECK("acl: pattern /# covers parent level", login("h1", "SN9", acl_token("SN9", R"({"v":1,"pub":["/a/#"]})")) == OK
+        && acl("h1", "SN9", AclAccess::write, "/a") == OK && acl("h1", "SN9", AclAccess::write, "/a/b/c") == OK
+        && acl("h1", "SN9", AclAccess::write, "/b") == NO);
+    CHECK("acl: missing sub list = no subscriptions", acl("h1", "SN9", AclAccess::subscribe, "/a/b") == NO);
+
+    CHECK("acl: token without acl denied in enforce", login("n1", "SN3", token("SN3", true, now)) == AuthResult::login_denied);
+    CHECK("acl: wrong acl version denied", login("n2", "SN3", acl_token("SN3", R"({"v":2,"pub":[],"sub":[]})")) == AuthResult::login_denied);
+    CHECK("acl: malformed pub list denied", login("n3", "SN3", acl_token("SN3", R"({"v":1,"pub":"/duke/iot/SN3/status"})")) == AuthResult::login_denied);
+    CHECK("acl: unknown client denied", acl("nobody", "SN4", AclAccess::write, "/duke/iot/SN4/status") == NO);
+    CHECK("acl: sub must still equal username", login("n4", "SN1", acl_token("SN2", DEVICE_ACL)) == AuthResult::login_denied);
+
+    // prune: entries of clients that are gone are dropped, live ones and re-logins kept
+    g_live_clients.clear();
+    g_live_clients["g1"] = std::shared_ptr<Client>(reinterpret_cast<Client *>(0x3), [](Client *) {});
+    flashmq_plugin_periodic_event(nullptr);
+    CHECK("acl: pruned client loses access", acl("a1", "SN1", AclAccess::write, "/duke/iot/SN1/status") == NO);
+    CHECK("acl: live client keeps access", acl("g1", "GW1", AclAccess::write, "/duke/iot/gateways/GW1/provision") == OK);
+    CHECK("acl: re-login restores access", login("a1", "SN1", acl_token("SN1", DEVICE_ACL)) == OK
+        && acl("a1", "SN1", AclAccess::write, "/duke/iot/SN1/status") == OK);
+
+    std::unordered_map<std::string, std::string> opts_log{{"jwt_secret_file", secret_file}, {"acl_mode", "log"}};
+    flashmq_plugin_main_init(opts_log);
+    CHECK("acl log: token without acl allowed", login("l1", "SN3", token("SN3", true, now)) == OK);
+    CHECK("acl log: its traffic allowed", acl("l1", "SN3", AclAccess::write, "/duke/iot/SN9/status") == OK);
+    CHECK("acl log: device login", login("l2", "SN1", acl_token("SN1", DEVICE_ACL)) == OK);
+    CHECK("acl log: would-deny publish allowed", acl("l2", "SN1", AclAccess::write, "/duke/iot/SN2/status") == OK);
+    CHECK("acl log: unknown client allowed", acl("nobody", "SN4", AclAccess::subscribe, "#") == OK);
+
+    std::unordered_map<std::string, std::string> opts_bad{{"jwt_secret_file", secret_file}, {"acl_mode", "strict"}};
+    flashmq_plugin_main_init(opts_bad);
+    CHECK("acl: unknown mode = enforce", login("u1", "SN3", token("SN3", true, now)) == AuthResult::login_denied);
+
+    flashmq_plugin_main_init(opts_off);
+    CHECK("acl off: unknown client allowed", acl("nobody", "SN4", AclAccess::subscribe, "#") == OK);
 
     std::cout << (g_failures == 0 ? "ALL PASSED" : std::to_string(g_failures) + " FAILED") << std::endl;
     return g_failures == 0 ? 0 : 1;

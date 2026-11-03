@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <optional>
 #include <chrono>
+#include <atomic>
+#include <algorithm>
 #include <ctime>
 #include <sys/stat.h>
 #include <jwt-cpp/jwt.h>
@@ -23,8 +25,17 @@
  *                     <username> issued before <unix-time> are refused, and connected clients holding
  *                     one are disconnected. Empty (default) = revocation checks off.
  *
+ *   acl_mode          Topic ACL from the JWT `acl` claim: off (default) | log | enforce.
+ *                     log = allow everything, log what enforce would deny. Unknown value = enforce.
+ *
  * The revocation file is re-read when it changes, from flashmq_plugin_periodic_event (interval:
  * `plugin_timer_period`). Write it atomically (temp file + rename).
+ *
+ * `acl` claim (set by the API, version 1):
+ *   {"v": 1, "pub": ["<filter>", ...], "sub": ["<filter>", ...]}   or   {"v": 1, "super": true}
+ * `pub` covers publish and the will; `sub` covers subscribe and delivery. MQTT wildcards (+, #) are
+ * allowed in the filters. A subscription is allowed only if every topic it can match is covered.
+ * The legacy `subs` / `publ` claims are ignored.
  */
 
 static const std::string DEFAULT_SECRET_FILE_PATH = "/etc/flashmq/jwt_secret.key";
@@ -47,6 +58,26 @@ struct ConnectedClient {
 };
 static std::unordered_map<std::string, ConnectedClient> g_clients;
 static std::mutex g_clients_mutex;
+
+// Topic ACL (acl_mode)
+enum class AclMode { off, log, enforce };
+static std::atomic<AclMode> g_acl_mode{AclMode::off};
+static constexpr double ACL_VERSION = 1;
+
+using TopicLevels = std::vector<std::string>;
+
+struct ClientAcl {
+    std::string username;
+    bool present = false; // token carried a valid `acl` claim
+    bool super = false;
+    std::vector<TopicLevels> pub;
+    std::vector<TopicLevels> sub;
+};
+
+// clientid -> ACL of its token. Replaced on every login; stale entries pruned in the periodic event
+// (not on disconnect: with a session takeover the old client's disconnect can follow the new login).
+static std::unordered_map<std::string, std::shared_ptr<const ClientAcl>> g_acls;
+static std::shared_mutex g_acls_mutex;
 
 static std::string opt(const std::unordered_map<std::string, std::string> &opts, const std::string &key, const std::string &fallback) {
     auto it = opts.find(key);
@@ -193,6 +224,149 @@ static void reload_revocations(bool force) {
     disconnect_revoked_clients(*map);
 }
 
+static TopicLevels split_topic(const std::string &topic) {
+    TopicLevels levels;
+    std::string::size_type start = 0;
+    while (true) {
+        auto pos = topic.find('/', start);
+        levels.push_back(topic.substr(start, pos == std::string::npos ? std::string::npos : pos - start));
+        if (pos == std::string::npos) {
+            return levels;
+        }
+        start = pos + 1;
+    }
+}
+
+/**
+ * True when every topic $filter can match is also matched by $pattern. A topic name (no wildcards)
+ * is a filter that matches only itself, so this is also the publish/deliver check.
+ */
+static bool pattern_covers(const TopicLevels &pattern, const TopicLevels &filter) {
+    std::size_t i = 0;
+    for (; i < pattern.size(); ++i) {
+        const std::string &p = pattern[i];
+        if (p == "#") {
+            return true; // the rest, including the parent level
+        }
+        if (i >= filter.size()) {
+            return false;
+        }
+        const std::string &f = filter[i];
+        if (f == "#") {
+            return false;
+        }
+        if (p == "+") {
+            continue;
+        }
+        if (f != p) {
+            return false; // includes a filter '+' against a literal level
+        }
+    }
+    return i == filter.size();
+}
+
+static bool any_covers(const std::vector<TopicLevels> &patterns, const TopicLevels &filter) {
+    return std::any_of(patterns.begin(), patterns.end(), [&](const TopicLevels &p) { return pattern_covers(p, filter); });
+}
+
+static AclMode parse_acl_mode(const std::string &value) {
+    if (value.empty() || value == "off") return AclMode::off;
+    if (value == "log") return AclMode::log;
+    if (value != "enforce") {
+        std::cerr << "[JWT Auth Plugin] Unknown acl_mode '" << value << "': using enforce." << std::endl;
+    }
+    return AclMode::enforce;
+}
+
+static const char *acl_mode_name(AclMode mode) {
+    return mode == AclMode::off ? "off" : (mode == AclMode::log ? "log" : "enforce");
+}
+
+/** Reads the `acl` claim; an absent, malformed or wrong-version claim gives an ACL with present = false. */
+template <typename Decoded>
+static std::shared_ptr<const ClientAcl> parse_acl(const Decoded &decoded, const std::string &username) {
+    auto acl = std::make_shared<ClientAcl>();
+    acl->username = username;
+    if (!decoded.has_payload_claim("acl")) {
+        return acl;
+    }
+
+    picojson::value value = decoded.get_payload_claim("acl").to_json();
+    if (!value.is<picojson::object>()) {
+        return acl;
+    }
+    const picojson::object &obj = value.get<picojson::object>();
+
+    auto version = obj.find("v");
+    if (version == obj.end() || !version->second.is<double>() || version->second.get<double>() != ACL_VERSION) {
+        return acl;
+    }
+
+    auto read_list = [&](const char *key, std::vector<TopicLevels> &out) -> bool {
+        auto it = obj.find(key);
+        if (it == obj.end()) {
+            return true; // no list = nothing allowed
+        }
+        if (!it->second.is<picojson::array>()) {
+            return false;
+        }
+        for (const auto &entry : it->second.get<picojson::array>()) {
+            if (!entry.is<std::string>()) {
+                return false;
+            }
+            out.push_back(split_topic(entry.get<std::string>()));
+        }
+        return true;
+    };
+
+    auto super = obj.find("super");
+    bool is_super = super != obj.end() && super->second.is<bool>() && super->second.get<bool>();
+    std::vector<TopicLevels> pub;
+    std::vector<TopicLevels> sub;
+    if (!read_list("pub", pub) || !read_list("sub", sub)) {
+        return acl;
+    }
+
+    auto result = std::make_shared<ClientAcl>();
+    result->username = username;
+    result->present = true;
+    result->super = is_super;
+    result->pub = std::move(pub);
+    result->sub = std::move(sub);
+    return result;
+}
+
+/** Forgets ACLs of clients that are no longer connected. */
+static void prune_acls() {
+    std::vector<std::pair<std::string, std::shared_ptr<const ClientAcl>>> entries;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_acls_mutex);
+        entries.assign(g_acls.begin(), g_acls.end());
+    }
+
+    std::vector<std::pair<std::string, std::shared_ptr<const ClientAcl>>> gone;
+    for (const auto &[clientid, acl] : entries) {
+        std::weak_ptr<Session> session;
+        flashmq_get_session_pointer(clientid, acl->username, session);
+        std::weak_ptr<Client> client;
+        flashmq_get_client_pointer(session, client);
+        if (client.expired()) {
+            gone.emplace_back(clientid, acl);
+        }
+    }
+
+    if (gone.empty()) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(g_acls_mutex);
+    for (const auto &[clientid, acl] : gone) {
+        auto it = g_acls.find(clientid);
+        if (it != g_acls.end() && it->second == acl) { // not replaced by a new login meanwhile
+            g_acls.erase(it);
+        }
+    }
+}
+
 extern "C" {
 
 /**
@@ -236,6 +410,13 @@ void flashmq_plugin_main_init(std::unordered_map<std::string, std::string> &plug
     } else {
         reload_revocations(true);
     }
+
+    g_acl_mode = parse_acl_mode(opt(plugin_opts, "acl_mode", "off"));
+    {
+        std::unique_lock<std::shared_mutex> lock(g_acls_mutex);
+        g_acls.clear();
+    }
+    std::cout << "[JWT Auth Plugin] Topic ACL mode: " << acl_mode_name(g_acl_mode) << "." << std::endl;
 }
 
 void flashmq_plugin_main_deinit(std::unordered_map<std::string, std::string> &plugin_opts) {
@@ -260,6 +441,9 @@ void flashmq_plugin_deinit(void *thread_data, std::unordered_map<std::string, st
 void flashmq_plugin_periodic_event(void *thread_data) {
     (void)thread_data;
     reload_revocations(false);
+    if (g_acl_mode != AclMode::off) {
+        prune_acls();
+    }
 }
 
 /**
@@ -316,6 +500,20 @@ AuthResult flashmq_plugin_login_check(
             return AuthResult::login_denied;
         }
 
+        AclMode acl_mode = g_acl_mode;
+        if (acl_mode != AclMode::off) {
+            auto acl = parse_acl(decoded, username);
+            if (!acl->present) {
+                if (acl_mode == AclMode::enforce) {
+                    std::cerr << "[JWT Auth Plugin] Auth failed for client '" << clientid << "': token for '" << username << "' has no valid acl claim." << std::endl;
+                    return AuthResult::login_denied;
+                }
+                flashmq_logf(LOG_NOTICE, "[JWT Auth Plugin] acl: token for '%s' (client '%s') has no valid acl claim (enforce would deny the login).", username.c_str(), clientid.c_str());
+            }
+            std::unique_lock<std::shared_mutex> lock(g_acls_mutex);
+            g_acls[clientid] = acl;
+        }
+
         if (!g_revocation_file.empty()) {
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             g_clients[clientid] = ConnectedClient{username, issued_at};
@@ -350,10 +548,66 @@ AuthResult flashmq_plugin_acl_check(
     std::optional<std::chrono::time_point<std::chrono::steady_clock>> expiryTime,
     const std::vector<std::pair<std::string, std::string>> *userProperties
 ) {
-    (void)thread_data; (void)access; (void)clientid; (void)username; (void)topic; (void)subtopics; (void)shareName;
+    (void)thread_data; (void)subtopics; (void)shareName;
     (void)payload; (void)qos; (void)retain; (void)correlationData; (void)responseTopic; (void)contentType;
     (void)expiryTime; (void)userProperties;
-    return AuthResult::success;
+
+    AclMode mode = g_acl_mode;
+    if (mode == AclMode::off) {
+        return AuthResult::success;
+    }
+
+    std::shared_ptr<const ClientAcl> acl;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_acls_mutex);
+        auto it = g_acls.find(clientid);
+        if (it != g_acls.end()) {
+            acl = it->second;
+        }
+    }
+
+    if (acl && !acl->present) {
+        // Token without an acl claim: logged once at login; only reachable in log mode.
+        return mode == AclMode::log ? AuthResult::success : AuthResult::acl_denied;
+    }
+
+    bool allowed = false;
+    const char *what = "access";
+    if (acl && acl->super) {
+        allowed = true;
+    } else if (acl) {
+        TopicLevels levels = split_topic(topic);
+        switch (access) {
+            case AclAccess::write:
+                what = "publish";
+                allowed = any_covers(acl->pub, levels);
+                break;
+            case AclAccess::register_will:
+                what = "will";
+                allowed = any_covers(acl->pub, levels);
+                break;
+            case AclAccess::read:
+                what = "deliver";
+                allowed = any_covers(acl->sub, levels);
+                break;
+            case AclAccess::subscribe:
+                what = "subscribe";
+                allowed = any_covers(acl->sub, levels);
+                break;
+            default:
+                allowed = false;
+        }
+    }
+
+    if (allowed) {
+        return AuthResult::success;
+    }
+
+    flashmq_logf(access == AclAccess::read ? LOG_INFO : LOG_NOTICE,
+        "[JWT Auth Plugin] acl denied%s: %s '%s' for client '%s' (username '%s')%s.",
+        mode == AclMode::log ? " (would deny)" : "", what, topic.c_str(), clientid.c_str(), username.c_str(),
+        acl ? "" : ", no ACL for this client");
+    return mode == AclMode::log ? AuthResult::success : AuthResult::acl_denied;
 }
 
 } // extern "C"
